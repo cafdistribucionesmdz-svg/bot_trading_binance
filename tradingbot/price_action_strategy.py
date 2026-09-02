@@ -1,86 +1,100 @@
 """Estrategia de price action con estructura de mercado.
 
-Replica la logica de un bot armado por fuera de este proyecto:
+Replica FIEL (linea a linea) de la logica del bot real que corre en MT5:
+detectar_swings / determinar_tendencia / es_pin_bar_* / es_envolvente_* /
+buscar_senal_entrada / el calculo de SL-TP-R de enviar_orden / y el ratchet
+de trailing de actualizar_trailing_stops.
 
-- Sigue la tendencia mayor: estructura de maximos/minimos crecientes (uptrend)
-  o decrecientes (downtrend), a partir de swings tipo fractal. Sin estructura
-  clara -> no opera.
-- Entra en pullbacks hacia la zona del ultimo swing de soporte (en uptrend) o
-  resistencia (en downtrend), confirmados con una vela de price action (pin
-  bar o envolvente) a favor de la tendencia.
-- SL detras del swing de estructura que origino la señal (con un pequeño
-  colchon de ATR). TP inicial a 2R.
-- Trailing por etapas: al llegar a +2R, SL a breakeven y TP se extiende a 3R;
-  al llegar a +3R, SL asegura +1R y TP se extiende a 4R (tope maximo).
+Diferencias respecto a una simulacion tick-a-tick (inevitables al trabajar
+con velas OHLC en vez de al bot viviendo con precios en tiempo real):
 
-Nota sobre simplificacion: con datos OHLC (sin ticks) no se puede saber el
-orden exacto de los eventos dentro de una misma vela. En cada vela primero se
-actualiza el escalon de trailing si el rango de esa vela lo alcanza (para que
-"llegar a 2R" extienda el objetivo en vez de cerrar en el TP viejo), y recien
-con esos niveles ya al dia se chequea si esa misma vela toca el SL o el TP.
+- Entrada: el bot real entra al precio de mercado (tick) apenas confirma la
+  señal en la ultima vela cerrada. Ac​a se aproxima entrando en la apertura
+  de la vela siguiente a la señal (no hay forma de sabre el tick exacto).
+- Estructura: el bot real recalcula los swings cada ciclo sobre las ultimas
+  (STRUCTURE_LOOKBACK + FETCH_BUFFER) velas (ventana deslizante). Ac​a se
+  reproduce filtrando, en cada vela, los swings confirmados cuyo indice cae
+  dentro de esa misma ventana reciente.
+- Trailing: el bot real chequea el precio cada 1 minuto (~continuo). Ac​a
+  el progreso de trailing solo se detecta a resolucion de vela (M15), lo
+  cual es una aproximacion mas conservadora (menos oportunidades de
+  "amarrar" un escalon de trailing dentro de una misma vela).
 """
 
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
-from . import indicators as ind
 from .backtester import BacktestConfig, Trade
 from .risk import cap_position_size, position_size
 
 
 @dataclass
 class PriceActionConfig:
-    swing_lookback: int = 2  # velas a cada lado para confirmar un swing (fractal)
-    atr_period: int = 14
-    pullback_tolerance_atr_mult: float = 0.5
-    pin_bar_wick_ratio: float = 0.6  # mecha dominante >= 60% del rango de la vela
-    pin_bar_body_ratio: float = 0.35  # cuerpo <= 35% del rango de la vela
-    sl_buffer_atr_mult: float = 0.1
-    initial_tp_r: float = 2.0
-    stage1_trigger_r: float = 2.0
-    stage1_sl_r: float = 0.0  # breakeven
-    stage1_tp_r: float = 3.0
-    stage2_trigger_r: float = 3.0
-    stage2_sl_r: float = 1.0
-    stage2_tp_r: float = 4.0  # tope maximo
+    swing_lookback: int = 5  # SWING_LOOKBACK
+    structure_lookback: int = 50  # STRUCTURE_LOOKBACK
+    fetch_buffer: int = 10  # el "+10" que se pide de mas al bajar velas
+    pullback_tolerance_pct: float = 0.0015  # 0.15%, igual que el bot real
+    pin_bar_wick_body_mult: float = 2.0  # mecha >= 2x cuerpo
+    pin_bar_body_ratio: float = 0.35  # cuerpo <= 35% del rango total
+    sl_buffer_price: float = 0.0010  # margen fijo de precio (10 pips en EURUSD/GBPUSD)
+    initial_tp_r: float = 2.0  # RISK_REWARD_INICIAL
+    trailing_step_r: float = 1.0  # TRAILING_STEP_R
+    rr_maximo: float = 4.0  # RR_MAXIMO
+
+    @property
+    def structure_window(self) -> int:
+        return self.structure_lookback + self.fetch_buffer
+
+
+def _es_pin_bar_alcista(o: float, h: float, l: float, c: float, cfg: PriceActionConfig) -> bool:
+    cuerpo = abs(c - o)
+    rango_total = h - l
+    if rango_total == 0:
+        return False
+    mecha_inferior = min(o, c) - l
+    return (mecha_inferior >= cfg.pin_bar_wick_body_mult * cuerpo) and (cuerpo <= cfg.pin_bar_body_ratio * rango_total)
+
+
+def _es_pin_bar_bajista(o: float, h: float, l: float, c: float, cfg: PriceActionConfig) -> bool:
+    cuerpo = abs(c - o)
+    rango_total = h - l
+    if rango_total == 0:
+        return False
+    mecha_superior = h - max(o, c)
+    return (mecha_superior >= cfg.pin_bar_wick_body_mult * cuerpo) and (cuerpo <= cfg.pin_bar_body_ratio * rango_total)
 
 
 def compute_confirmations(df: pd.DataFrame, cfg: PriceActionConfig) -> pd.DataFrame:
     out = df.copy()
-    out["atr"] = ind.atr(out, cfg.atr_period)
 
     k = cfg.swing_lookback
     window = 2 * k + 1
     out["is_swing_high"] = out["high"] == out["high"].rolling(window, center=True).max()
     out["is_swing_low"] = out["low"] == out["low"].rolling(window, center=True).min()
 
-    body = (out["close"] - out["open"]).abs()
-    total_range = (out["high"] - out["low"]).replace(0, np.nan)
-    upper_wick = out["high"] - out[["open", "close"]].max(axis=1)
-    lower_wick = out[["open", "close"]].min(axis=1) - out["low"]
+    o, h, l, c = out["open"], out["high"], out["low"], out["close"]
+    prev_o, prev_c = o.shift(1), c.shift(1)
 
-    bullish_pin = (lower_wick >= cfg.pin_bar_wick_ratio * total_range) & (
-        body <= cfg.pin_bar_body_ratio * total_range
-    )
-    bearish_pin = (upper_wick >= cfg.pin_bar_wick_ratio * total_range) & (
-        body <= cfg.pin_bar_body_ratio * total_range
-    )
+    bullish_pin = [
+        _es_pin_bar_alcista(oi, hi, li, ci, cfg) for oi, hi, li, ci in zip(o, h, l, c)
+    ]
+    bearish_pin = [
+        _es_pin_bar_bajista(oi, hi, li, ci, cfg) for oi, hi, li, ci in zip(o, h, l, c)
+    ]
+    out["bullish_pin"] = bullish_pin
+    out["bearish_pin"] = bearish_pin
 
-    prev_open = out["open"].shift(1)
-    prev_close = out["close"].shift(1)
-    prev_bearish = prev_close < prev_open
-    prev_bullish = prev_close > prev_open
-    cur_bullish = out["close"] > out["open"]
-    cur_bearish = out["close"] < out["open"]
+    prev_bearish = prev_c < prev_o
+    prev_bullish = prev_c > prev_o
+    cur_bullish = c > o
+    cur_bearish = c < o
+    bullish_engulf = prev_bearish & cur_bullish & (o <= prev_c) & (c >= prev_o)
+    bearish_engulf = prev_bullish & cur_bearish & (o >= prev_c) & (c <= prev_o)
 
-    bullish_engulf = prev_bearish & cur_bullish & (out["open"] <= prev_close) & (out["close"] >= prev_open)
-    bearish_engulf = prev_bullish & cur_bearish & (out["open"] >= prev_close) & (out["close"] <= prev_open)
-
-    out["bullish_confirmation"] = (bullish_pin | bullish_engulf).fillna(False)
-    out["bearish_confirmation"] = (bearish_pin | bearish_engulf).fillna(False)
+    out["bullish_confirmation"] = (out["bullish_pin"] | bullish_engulf.fillna(False))
+    out["bearish_confirmation"] = (out["bearish_pin"] | bearish_engulf.fillna(False))
     return out
 
 
@@ -91,8 +105,6 @@ def run_backtest(df: pd.DataFrame, cfg: PriceActionConfig, bt_cfg: BacktestConfi
     highs = data["high"].to_numpy()
     lows = data["low"].to_numpy()
     opens = data["open"].to_numpy()
-    closes = data["close"].to_numpy()
-    atrs = data["atr"].to_numpy()
     is_sw_high = data["is_swing_high"].to_numpy()
     is_sw_low = data["is_swing_low"].to_numpy()
     bull_conf = data["bullish_confirmation"].to_numpy()
@@ -100,25 +112,34 @@ def run_backtest(df: pd.DataFrame, cfg: PriceActionConfig, bt_cfg: BacktestConfi
     index = data.index
 
     k = cfg.swing_lookback
-    swing_highs: list[float] = []
-    swing_lows: list[float] = []
+    window = cfg.structure_window
+
+    swing_highs: list[tuple[int, float]] = []  # (indice, precio), en orden cronologico
+    swing_lows: list[tuple[int, float]] = []
 
     capital = bt_cfg.initial_capital
     equity_curve = []
     trades: list[Trade] = []
 
-    position = None  # dict: trade, r, stage
+    position = None  # dict: trade, r, sl_r, tp_r
     pending_entry = None  # (side, sl) confirmado en la vela anterior
 
     for i in range(n):
         j = i - k
         if j >= 0:
-            # se descartan duplicados consecutivos (ej: dos velas empatadas en el mismo
-            # extremo) para no romper la comparacion de "maximo/minimo creciente"
-            if is_sw_high[j] and (not swing_highs or highs[j] != swing_highs[-1]):
-                swing_highs.append(highs[j])
-            if is_sw_low[j] and (not swing_lows or lows[j] != swing_lows[-1]):
-                swing_lows.append(lows[j])
+            if is_sw_high[j]:
+                swing_highs.append((j, highs[j]))
+            if is_sw_low[j]:
+                swing_lows.append((j, lows[j]))
+
+        # ventana deslizante: se descartan swings que quedaron fuera de las
+        # ultimas `structure_window` velas (como el bot real, que solo baja
+        # las ultimas STRUCTURE_LOOKBACK+FETCH_BUFFER velas cada ciclo)
+        cutoff = i - window
+        while swing_highs and swing_highs[0][0] <= cutoff:
+            swing_highs.pop(0)
+        while swing_lows and swing_lows[0][0] <= cutoff:
+            swing_lows.pop(0)
 
         ts = index[i]
 
@@ -134,42 +155,37 @@ def run_backtest(df: pd.DataFrame, cfg: PriceActionConfig, bt_cfg: BacktestConfi
                     position = {
                         "trade": Trade(side=side, entry_time=ts, entry_price=entry_price, qty=qty, sl=sl, tp=tp),
                         "r": r,
-                        "stage": 0,
+                        "sl_r": -1.0,
+                        "tp_r": cfg.initial_tp_r,
                     }
         pending_entry = None
 
         if position is not None:
             trade: Trade = position["trade"]
             r = position["r"]
-            stage = position["stage"]
 
-            # 1) progresion de etapas primero (con el rango de ESTA vela): si la vela
-            # alcanza un nuevo escalon, el SL/TP se actualiza antes de chequear la
-            # salida, para que "llegar a 2R" extienda el TP en vez de cerrar en el
-            # objetivo viejo.
-            favorable = (highs[i] - trade.entry_price) / r if trade.side == "long" else (
+            favorable_r = (highs[i] - trade.entry_price) / r if trade.side == "long" else (
                 trade.entry_price - lows[i]
             ) / r
 
-            if stage < 2 and favorable >= cfg.stage2_trigger_r:
-                stage = 2
+            # ratchet de trailing: identico al while() de actualizar_trailing_stops()
+            tp_r = position["tp_r"]
+            sl_r = position["sl_r"]
+            changed = False
+            while favorable_r >= tp_r and tp_r < cfg.rr_maximo - 1e-9:
+                sl_r = tp_r - cfg.initial_tp_r
+                tp_r = min(cfg.rr_maximo, tp_r + cfg.trailing_step_r)
+                changed = True
+            if changed:
+                position["sl_r"] = sl_r
+                position["tp_r"] = tp_r
                 if trade.side == "long":
-                    trade.sl = trade.entry_price + cfg.stage2_sl_r * r
-                    trade.tp = trade.entry_price + cfg.stage2_tp_r * r
+                    trade.sl = trade.entry_price + sl_r * r
+                    trade.tp = trade.entry_price + tp_r * r
                 else:
-                    trade.sl = trade.entry_price - cfg.stage2_sl_r * r
-                    trade.tp = trade.entry_price - cfg.stage2_tp_r * r
-            elif stage < 1 and favorable >= cfg.stage1_trigger_r:
-                stage = 1
-                if trade.side == "long":
-                    trade.sl = trade.entry_price + cfg.stage1_sl_r * r
-                    trade.tp = trade.entry_price + cfg.stage1_tp_r * r
-                else:
-                    trade.sl = trade.entry_price - cfg.stage1_sl_r * r
-                    trade.tp = trade.entry_price - cfg.stage1_tp_r * r
-            position["stage"] = stage
+                    trade.sl = trade.entry_price - sl_r * r
+                    trade.tp = trade.entry_price - tp_r * r
 
-            # 2) recien ahora se chequea la salida, con los niveles ya al dia
             if trade.side == "long":
                 hit_sl = lows[i] <= trade.sl
                 hit_tp = highs[i] >= trade.tp
@@ -197,17 +213,27 @@ def run_backtest(df: pd.DataFrame, cfg: PriceActionConfig, bt_cfg: BacktestConfi
                 trades.append(trade)
                 position = None
 
-        if position is None and len(swing_highs) >= 2 and len(swing_lows) >= 2 and not pd.isna(atrs[i]):
-            uptrend = swing_highs[-1] > swing_highs[-2] and swing_lows[-1] > swing_lows[-2]
-            downtrend = swing_highs[-1] < swing_highs[-2] and swing_lows[-1] < swing_lows[-2]
-            tolerance = cfg.pullback_tolerance_atr_mult * atrs[i]
+        if position is None and swing_highs and swing_lows:
+            if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+                ultimo_high, penultimo_high = swing_highs[-1][1], swing_highs[-2][1]
+                ultimo_low, penultimo_low = swing_lows[-1][1], swing_lows[-2][1]
+                alcista = ultimo_high > penultimo_high and ultimo_low > penultimo_low
+                bajista = ultimo_high < penultimo_high and ultimo_low < penultimo_low
+            else:
+                alcista = bajista = False
 
-            if uptrend and bull_conf[i] and abs(lows[i] - swing_lows[-1]) <= tolerance:
-                sl = swing_lows[-1] - cfg.sl_buffer_atr_mult * atrs[i]
-                pending_entry = ("long", sl)
-            elif downtrend and bear_conf[i] and abs(highs[i] - swing_highs[-1]) <= tolerance:
-                sl = swing_highs[-1] + cfg.sl_buffer_atr_mult * atrs[i]
-                pending_entry = ("short", sl)
+            if alcista:
+                nivel_estructura = swing_lows[-1][1]
+                cerca_del_soporte = lows[i] <= nivel_estructura * (1 + cfg.pullback_tolerance_pct)
+                if cerca_del_soporte and bull_conf[i]:
+                    sl = nivel_estructura - cfg.sl_buffer_price
+                    pending_entry = ("long", sl)
+            elif bajista:
+                nivel_estructura = swing_highs[-1][1]
+                cerca_de_resistencia = highs[i] >= nivel_estructura * (1 - cfg.pullback_tolerance_pct)
+                if cerca_de_resistencia and bear_conf[i]:
+                    sl = nivel_estructura + cfg.sl_buffer_price
+                    pending_entry = ("short", sl)
 
         equity_curve.append((ts, capital))
 
