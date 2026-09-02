@@ -31,14 +31,13 @@ class Trade:
     exit_reason: str = ""
 
 
-def run_backtest(df: pd.DataFrame, strat_cfg: StrategyConfig, bt_cfg: BacktestConfig):
-    """Simula la estrategia sobre velas historicas.
+def simulate(data: pd.DataFrame, atr_sl_mult: float, atr_tp_mult: float, bt_cfg: BacktestConfig):
+    """Simula sobre un DataFrame que ya tiene las columnas long_signal/short_signal/atr.
 
     La entrada se ejecuta en la apertura de la vela siguiente a la señal, con SL/TP
     calculados a partir del ATR de la vela donde se confirmo la señal. Si en la misma
     vela se tocan SL y TP se asume el peor caso (sale por SL).
     """
-    data = generate_signals(df, strat_cfg)
     capital = bt_cfg.initial_capital
     equity_curve = []
     trades: list[Trade] = []
@@ -88,11 +87,11 @@ def run_backtest(df: pd.DataFrame, strat_cfg: StrategyConfig, bt_cfg: BacktestCo
 
             side = "long" if prev["long_signal"] else "short"
             if side == "long":
-                sl = entry_price - strat_cfg.atr_sl_mult * atr_val
-                tp = entry_price + strat_cfg.atr_tp_mult * atr_val
+                sl = entry_price - atr_sl_mult * atr_val
+                tp = entry_price + atr_tp_mult * atr_val
             else:
-                sl = entry_price + strat_cfg.atr_sl_mult * atr_val
-                tp = entry_price - strat_cfg.atr_tp_mult * atr_val
+                sl = entry_price + atr_sl_mult * atr_val
+                tp = entry_price - atr_tp_mult * atr_val
 
             qty = position_size(capital, entry_price, sl, bt_cfg.risk_pct)
             qty = cap_position_size(qty, entry_price, capital, bt_cfg.leverage)
@@ -107,6 +106,12 @@ def run_backtest(df: pd.DataFrame, strat_cfg: StrategyConfig, bt_cfg: BacktestCo
     equity_df = pd.DataFrame(equity_curve, columns=["time", "equity"]).set_index("time")
     trades_df = pd.DataFrame([t.__dict__ for t in trades])
     return trades_df, equity_df
+
+
+def run_backtest(df: pd.DataFrame, strat_cfg: StrategyConfig, bt_cfg: BacktestConfig):
+    """Genera las señales de la estrategia de un solo timeframe y las simula."""
+    data = generate_signals(df, strat_cfg)
+    return simulate(data, strat_cfg.atr_sl_mult, strat_cfg.atr_tp_mult, bt_cfg)
 
 
 def compute_stats(trades_df: pd.DataFrame, equity_df: pd.DataFrame, initial_capital: float) -> dict:
