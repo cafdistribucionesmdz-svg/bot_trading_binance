@@ -114,6 +114,77 @@ def run_backtest(df: pd.DataFrame, strat_cfg: StrategyConfig, bt_cfg: BacktestCo
     return simulate(data, strat_cfg.atr_sl_mult, strat_cfg.atr_tp_mult, bt_cfg)
 
 
+def simulate_with_levels(data: pd.DataFrame, bt_cfg: BacktestConfig):
+    """Igual que `simulate`, pero para estrategias que ya calculan el SL/TP como
+    niveles de precio concretos (columnas sl_level/tp_level), en vez de multiplos
+    de ATR (por ejemplo, CRT: TP = lado opuesto de un rango, SL = mas alla de una
+    barrida de liquidez).
+    """
+    capital = bt_cfg.initial_capital
+    equity_curve = []
+    trades: list[Trade] = []
+    position: Optional[Trade] = None
+
+    for i in range(1, len(data)):
+        row = data.iloc[i]
+        prev = data.iloc[i - 1]
+        ts = data.index[i]
+
+        if position is not None:
+            if position.side == "long":
+                hit_sl = row["low"] <= position.sl
+                hit_tp = row["high"] >= position.tp
+            else:
+                hit_sl = row["high"] >= position.sl
+                hit_tp = row["low"] <= position.tp
+
+            exit_price = None
+            reason = ""
+            if hit_sl:
+                exit_price, reason = position.sl, "SL"
+            elif hit_tp:
+                exit_price, reason = position.tp, "TP"
+
+            if exit_price is not None:
+                direction = 1 if position.side == "long" else -1
+                gross_pnl = direction * (exit_price - position.entry_price) * position.qty
+                fees = (position.entry_price + exit_price) * position.qty * bt_cfg.taker_fee
+                pnl = gross_pnl - fees
+
+                capital += pnl
+                position.exit_time = ts
+                position.exit_price = exit_price
+                position.pnl = pnl
+                position.exit_reason = reason
+                trades.append(position)
+                position = None
+
+        if position is None and (prev["long_signal"] or prev["short_signal"]):
+            entry_price = row["open"]
+            sl = prev["sl_level"]
+            tp = prev["tp_level"]
+
+            if pd.isna(sl) or pd.isna(tp):
+                equity_curve.append((ts, capital))
+                continue
+
+            side = "long" if prev["long_signal"] else "short"
+
+            qty = position_size(capital, entry_price, sl, bt_cfg.risk_pct)
+            qty = cap_position_size(qty, entry_price, capital, bt_cfg.leverage)
+
+            if qty > 0:
+                position = Trade(
+                    side=side, entry_time=ts, entry_price=entry_price, qty=qty, sl=sl, tp=tp
+                )
+
+        equity_curve.append((ts, capital))
+
+    equity_df = pd.DataFrame(equity_curve, columns=["time", "equity"]).set_index("time")
+    trades_df = pd.DataFrame([t.__dict__ for t in trades])
+    return trades_df, equity_df
+
+
 def compute_stats(trades_df: pd.DataFrame, equity_df: pd.DataFrame, initial_capital: float) -> dict:
     if trades_df.empty:
         return {"trades": 0, "total_return_pct": 0.0}
